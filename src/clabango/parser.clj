@@ -43,6 +43,8 @@
         (and (= c \})
              (= nc \})))))
 
+;;; Change StringBuffer for StringBuilder
+
 (defn buffer-string [^String s fileref i max offset line]
   (let [sb (StringBuffer.)]
     (loop [ni i]
@@ -145,6 +147,10 @@
         ((clojure.set/difference (set (vals valid-tags-snapshot))
                                  #{:inline})
          tag-name))))
+
+;; (let [[tag & args] (-> s
+;;                        (clojure.string/trim)
+;;                        (clojure.string/split #"\s+"))])
 
 (defn parse-tags [ast]
   (lazy-seq

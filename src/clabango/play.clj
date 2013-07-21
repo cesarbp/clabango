@@ -7,8 +7,7 @@
             [clabango.tags :refer [valid-tags]])
   (:import [java.io PushbackReader CharArrayReader]))
 
-;;; TODO - finish tag buffers
-;;; TODO - turn tokens into fns
+;;; TODO - implement filter/tag parsers
 
 (defn ^PushbackReader make-reader
   [^String s]
@@ -21,25 +20,53 @@
 (declare buffer-string buffer-filter buffer-tag)
 
 (defn lexer*
-  [^PushbackReader r state ast]
-  (loop [state state ast ast c (.read r)]
-    (if (== -1 c)
-      ast
-      (let [c (char c)]
-        (case state
-          :read-string
-          (recur (if (= filter-second c) :read-filter :read-tag)
-                 (conj ast (buffer-string r))
-                 (.read r))
-          :read-filter
+  [^PushbackReader r state ast tokens-to-find]
+  (loop [state state ast ast to-find tokens-to-find]
+    (case state
+      :read-string
+      (let [[next-step buffered-str] (buffer-string r)]
+        (case next-step
+          ;; Found end of string
+          ;; TODO - error if there's still a tag to find
+          :end ast
+          :read-filter (recur :read-filter
+                              (conj ast buffered-str)
+                              to-find)
+          :read-tag (recur :read-tag
+                           (conj ast buffered-str)
+                           to-find)))
+      :read-filter
+      (recur :read-string
+             (conj ast {:type :filter
+                        :body (buffer-filter r)})
+             to-find)
+      :read-tag
+      (let [{:keys [status tag closing-tag args]} (buffer-tag r)]
+        (case status
+          :found-closing-tag
+          (let [tag-to-find (peek to-find)]
+            (if-not (= tag-to-find closing-tag)
+              (throw (IllegalStateException. (str "Expected closing tag "
+                                                  tag-to-find
+                                                  ". Got " tag " instead.")))
+              (recur :read-string
+                     ast
+                     (pop to-find))))
+          :found-opening-tag
+          ;; Keep parsing after the tag, looks kinda silly
           (recur :read-string
-                 (conj ast {:type :filter
-                            :body (buffer-filter r)})
-                 (.read r))
-          :read-tag
-          (recur :read-string
-                 (conj ast (buffer-tag r))
-                 (.read r)))))))
+                 (conj ast
+                       {:type :tag
+                        :tag tag
+                        :args args
+                        ;; Parse the body of the tag with a brand new tree
+                        ;; And empty tokens-to-find stack
+                        :body
+                        (when-not (= :inline closing-tag)
+                          (lexer* r :read-string [] []))})
+                 (if (= :inline closing-tag)
+                   to-find
+                   (conj to-find closing-tag))))))))
 
 (defn buffer-string
   [^PushbackReader r]
@@ -47,21 +74,23 @@
     (loop [cn (.read r)]
       (if (== cn -1)
         ;; Finished reading
-        (str sb)
+        [:end
+         (str sb)]
         (let [c (char cn)]
           (if (= tag-opener c)
             (let [cn2 (.read r)]
               (if (== cn2 -1)
                 ;; Reached end of reader
                 (do (.append sb c)
-                    (str sb))
+                    [:end
+                     (str sb)])
                 (let [c2 (char cn2)]
                   (if (or (= filter-second c2)
                           (= tag-second c2))
-                    ;; Finished reading because we found a token start
-                    ;; Unread last so lexer* can know whether its tag or filter
-                    (do (.unread r (int c2))
-                        (str sb))
+                    [(if (= filter-second c2)
+                       :read-filter
+                       :read-tag)
+                     (str sb)]
                     (do (.append sb c)
                         (.append sb c2)
                         (recur (.read r)))))))
@@ -88,81 +117,64 @@
                     (do (.append sb c)
                         (.append sb c2)
                         (str sb))))))
-            ;; Possibly found a nested token - probably illegal
-            \{
-            (let [cn2 (.read r)]
-              (if (== -1 cn2)
-                (throw (IllegalStateException. "Filter with no closing '}}'"))
-                (let [c2 (char cn2)]
-                  (case c2
-                    ;; Nested filter
-                    \{ {:type :filter
-                        :body (buffer-filter r)}
-                    ;; Nested tag
-                    \% {:type :tag
-                        :body (buffer-tag r)}
-                    ;; Didnt find a nested token
-                    (do (.append sb c)
-                        (.append sb c2)
-                        (recur (.read r)))))))
             (do (.append sb c)
                 (recur (.read r)))))))))
 
-(declare buffer-tag-args buffer-tag-body buffer-tag-closing parse-tag-args)
+(declare parse-tag-args)
 
 (defn buffer-tag
   [^PushbackReader r]
-  (let [{:keys [name args closing]} (buffer-tag-args r)
-        ]
-    (when-not (= :inline closing)
-      (buffer-tag-closing r closing))
-    (if (= :inline closing)
-      {:type :tag-inline
-       :args args
-       :name name}
-      (let [body (body (lexer* r :read-string []))]
-        {:type :tag
-         :args args
-         :name name
-         :body body}))))
-
-(defn buffer-tag-args
-  [^PushbackReader r]
   (let [sb (StringBuilder.)]
     (loop [cn (.read r)]
       (if (== -1 cn)
-        (throw (IllegalStateException. "Tag with no closing '%}'"))
+        (throw (IllegalStateException. "Tag with no closing %}"))
         (let [c (char cn)]
-          (if (= \% c)
-            ;; Possibly found the end of the tag args
+          (case c
+            ;; Possibly found end of tag '%}'
+            \%
             (let [cn2 (.read r)]
               (if (== -1 cn2)
-                (throw (IllegalStateException. "Tag with no closing '%}'"))
+                (throw (IllegalStateException. "Tag with no closing %}"))
                 (let [c2 (char cn2)]
-                  (if (= \} c2)
-                    ;; Found the end of the tag args
-                    (str sb)
+                  (case c
+                    \}
+                    ;; Return the map result of parsing the tag args
+                    (parse-tag-args (str sb))
                     (do (.append sb c)
                         (.append sb c2)
                         (recur (.read r)))))))
             (do (.append sb c)
                 (recur (.read r)))))))))
 
-(defn buffer-tag-closing
-  [^PushbackReader r to-find]
-  (let [sb (StringBuilder.)]
-    (loop [cn (.read r)]
-      (if (== -1 cn)
-        (throw (IllegalStateException. (str "Didn't find '" to-find "' closing tag")))
-        ()))))
+
+(defn type-of-tag
+  [tag]
+  (let [vtags @valid-tags
+        opening (set (keys vtags))
+        closing (set (vals vtags))]
+    (cond
+     (or (= :inline (closing tag))
+         (opening tag))
+     :opening
+     (closing tag)
+     :closing
+     :else
+     :invalid)))
 
 (defn parse-tag-args
   [s]
-  (let [[tag & args] (-> s
-                         (s/trim)
-                         (s/split #"\s+"))]
-    (if-not (find @valid-tags tag)
+  (let [[tag & args]
+        ;; TODO - find out actual spec
+        (-> s
+            (s/trim)
+            (s/split #"\s+"))
+        tag-type (type-of-tag tag)
+        closing-tag (@valid-tags tag)]
+    (if (= :invalid tag-type)
       (throw (IllegalStateException. (str "Invalid tag:" tag)))
       {:name tag
        :args args
-       :closing (@valid-tags tag)})))
+       :status (case tag-type
+                 :opening :found-opening-tag
+                 :closing :found-closing-tag)
+       :closing-tag closing-tag})))
